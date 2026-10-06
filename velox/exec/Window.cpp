@@ -17,6 +17,7 @@
 
 #include <limits>
 
+#include "velox/common/base/SimdUtil.h"
 #include "velox/common/testutil/TestValue.h"
 #include "velox/exec/OperatorType.h"
 #include "velox/exec/OperatorUtils.h"
@@ -538,22 +539,85 @@ namespace {
 // This function identifies the rows that violate the framing requirements
 // and sets bits in the validFrames SelectivityVector for usage in the
 // WindowFunction subsequently.
+//
+// For each row i the three validity predicates are:
+//   P1: frameEnd[i]   >= 0
+//   P2: frameStart[i] <= lastRow
+//   P3: frameStart[i] <= frameEnd[i]
+// Rows passing all three are clamped to [0, lastRow]. Rows failing any
+// predicate are marked invalid in validFrames.
+//
+// The AVX2 path evaluates all three predicates on 8 int32 lanes
+// simultaneously, writes clamped values in one pass, and only falls back to
+// scalar to clear the (rare) newly-invalid bits.
 void computeValidFrames(
     vector_size_t lastRow,
     vector_size_t numRows,
     vector_size_t* rawFrameStarts,
     vector_size_t* rawFrameEnds,
     SelectivityVector& validFrames) {
-  for (auto i = 0; i < numRows; ++i) {
+#if XSIMD_WITH_AVX2
+  using batch_i32 = xsimd::batch<int32_t>;
+  // AVX2 always gives 8-wide int32 batches (256 bits / 32 bits).
+  static_assert(batch_i32::size == 8, "");
+
+  // SelectivityVector stores one bit per row in a contiguous uint64_t array.
+  // Bytes are LSB-first: byte k covers rows [8k, 8k+7], with bit 0 = row 8k.
+  // Since i is always a multiple of 8 inside the loop, byte i/8 is exactly
+  // the byte for the current 8-row batch.
+  const uint8_t* validBitBytes =
+      reinterpret_cast<const uint8_t*>(validFrames.allBits());
+
+  const batch_i32 kZero(0);
+  const batch_i32 kLastRow(lastRow);
+
+  vector_size_t i = 0;
+  for (; i + 8 <= numRows; i += 8) {
+    // Read the 8 existing validity bits for rows [i, i+8).
+    const uint8_t existingBits = validBitBytes[i >> 3];
+
+    // Fast path: skip if all eight rows are already invalid.
+    if (existingBits == 0) {
+      continue;
+    }
+
+    const batch_i32 starts =
+        batch_i32::load_unaligned(rawFrameStarts + i);
+    const batch_i32 ends =
+        batch_i32::load_unaligned(rawFrameEnds + i);
+
+    // Evaluate all three predicates simultaneously.
+    const auto valid =
+        (ends >= kZero) & (starts <= kLastRow) & (starts <= ends);
+
+    // Write clamped values for passing rows; originals for failing ones
+    // (failing rows will be marked invalid below; their values are unused).
+    xsimd::select(valid, xsimd::max(starts, kZero), starts)
+        .store_unaligned(rawFrameStarts + i);
+    xsimd::select(valid, xsimd::min(ends, kLastRow), ends)
+        .store_unaligned(rawFrameEnds + i);
+
+    // Determine which rows were previously valid but now fail.
+    const uint8_t passedBits =
+        static_cast<uint8_t>(simd::toBitMask<int32_t>(valid));
+    uint8_t nowInvalid = existingBits & ~passedBits;
+
+    // Mark newly-invalid rows; loop runs only when frame violations occur,
+    // which is the exceptional case for well-formed queries.
+    while (nowInvalid) {
+      const int j = __builtin_ctz(static_cast<uint32_t>(nowInvalid));
+      validFrames.setValid(i + j, false);
+      nowInvalid &= nowInvalid - 1;
+    }
+  }
+
+  // Scalar tail for the last (numRows % 8) rows.
+  for (; i < numRows; ++i) {
     if (!validFrames.isValid(i)) {
       continue;
     }
     const vector_size_t frameStart = rawFrameStarts[i];
     const vector_size_t frameEnd = rawFrameEnds[i];
-    // All valid frames require frameStart <= frameEnd to define the frame rows.
-    // Also, frameEnd >= 0, so that the frameEnd doesn't fall before the
-    // partition. And frameStart <= lastRow so that the frameStart doesn't fall
-    // after the partition rows.
     if (frameStart <= frameEnd && frameEnd >= 0 && frameStart <= lastRow) {
       rawFrameStarts[i] = std::max(frameStart, 0);
       rawFrameEnds[i] = std::min(frameEnd, lastRow);
@@ -561,6 +625,22 @@ void computeValidFrames(
       validFrames.setValid(i, false);
     }
   }
+#else
+  // Scalar fallback for non-AVX2 architectures.
+  for (auto i = 0; i < numRows; ++i) {
+    if (!validFrames.isValid(i)) {
+      continue;
+    }
+    const vector_size_t frameStart = rawFrameStarts[i];
+    const vector_size_t frameEnd = rawFrameEnds[i];
+    if (frameStart <= frameEnd && frameEnd >= 0 && frameStart <= lastRow) {
+      rawFrameStarts[i] = std::max(frameStart, 0);
+      rawFrameEnds[i] = std::min(frameEnd, lastRow);
+    } else {
+      validFrames.setValid(i, false);
+    }
+  }
+#endif
   validFrames.updateBounds();
 }
 } // namespace
