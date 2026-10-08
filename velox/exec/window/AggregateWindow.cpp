@@ -341,6 +341,8 @@ class AggregateWindowFunction : public exec::WindowFunction {
     // the aggregate to the final result.
     aggregateResultVector_ = BaseVector::create(resultType, 1, pool_);
 
+    slidingAggDisabled_ = config.windowSlidingAggDisabled();
+
     computeDefaultAggregateValue(resultType);
   }
 
@@ -408,7 +410,7 @@ class AggregateWindowFunction : public exec::WindowFunction {
           rawFrameEnds,
           resultOffset,
           result);
-    } else if (frameMetadata.slidingWindow) {
+    } else if (frameMetadata.slidingWindow && !slidingAggDisabled_) {
       slidingWindowAggregation(
           validRows,
           frameMetadata,
@@ -767,6 +769,12 @@ class AggregateWindowFunction : public exec::WindowFunction {
   vector_size_t rightPtr_{0};
   /// Leftmost partition row index currently in the two-stack.
   vector_size_t leftPtr_{0};
+
+  /// When true, skip the two-stack path and fall through to simpleAggregation
+  /// even for monotonically sliding frames. Controlled by the
+  /// window_sliding_agg_disabled query config; useful for benchmarking and
+  /// debugging.
+  bool slidingAggDisabled_{false};
 };
 
 } // namespace

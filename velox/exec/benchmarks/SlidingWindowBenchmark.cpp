@@ -21,24 +21,17 @@
 // 7db3cab52 introduces a two-stack (deque) algorithm that amortises cost to
 // O(1) per row, O(N) total.
 //
-// Key experiment: fix partition size N and vary K. With the two-stack the
-// wall-clock time is flat across K values; without it the time would grow
-// proportionally to K. The benchmark also compares against UNBOUNDED PRECEDING
-// (the pre-existing O(N) incremental path) as a throughput ceiling.
+// The benchmark has three groups.
 //
-// Benchmark groups
-// ────────────────
-// Group A – vary K, fixed N=100 K rows, sum(v):
-//   slidingWindowSum_k10    ROWS BETWEEN    10 PRECEDING AND CURRENT ROW
-//   slidingWindowSum_k100   ROWS BETWEEN   100 PRECEDING AND CURRENT ROW
-//   slidingWindowSum_k1000  ROWS BETWEEN  1000 PRECEDING AND CURRENT ROW
-//   slidingWindowSum_k10000 ROWS BETWEEN 10000 PRECEDING AND CURRENT ROW
-//   unboundedSum            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+// Group A – before vs after, fixed N=100 K, sum(v):
+//   For each K in {10, 100, 1000, 10000}, a BENCHMARK_RELATIVE pair is shown:
+//     naive_sum_kK   – window_sliding_agg_disabled=true  (O(N·K) recompute)
+//     twoStack_sum_kK – window_sliding_agg_disabled=false (O(N) two-stack)
+//   With the two-stack the "relative" column should be ~K× for large K.
 //
-// Group B – avg(v) at the same K values (avg has a complex ROW intermediate
-//   type, exercising the intermediate-type resolution added in 7db3cab52).
+// Group B – same for avg(v), which uses a ROW(sum,count) intermediate type.
 //
-// Group C – vary N, fixed K=100: shows O(N) scaling for both sum and avg.
+// Group C – vary N at K=100 to confirm O(N) linear scaling for the two-stack.
 //
 // Run:
 //   velox_sliding_window_benchmark --bm_min_iters=5
@@ -67,24 +60,24 @@ constexpr int32_t kOutputBatchRows = 1'000;
 class SlidingWindowBenchmark : public VectorTestBase {
  public:
   void addBenchmarks() {
-    // Group A: vary K, N=100 K, sum(v).
-    addCase("slidingWindowSum_k10", 100'000, 10, "sum(v)");
-    addCase("slidingWindowSum_k100", 100'000, 100, "sum(v)");
-    addCase("slidingWindowSum_k1000", 100'000, 1'000, "sum(v)");
-    addCase("slidingWindowSum_k10000", 100'000, 10'000, "sum(v)");
-    addCase("unboundedSum", 100'000, -1 /*unbounded*/, "sum(v)");
+    // Group A: naive vs two-stack, N=100 K, sum(v).
+    for (int32_t k : {10, 100, 1'000, 10'000}) {
+      const std::string ks = std::to_string(k);
+      addCase("naive_sum_k" + ks, 100'000, k, "sum(v)", /*disableSliding=*/true);
+      addRelCase("twoStack_sum_k" + ks, 100'000, k, "sum(v)", /*disableSliding=*/false);
+    }
 
-    // Group B: vary K, N=100 K, avg(v) — tests ROW intermediate type.
-    addCase("slidingWindowAvg_k10", 100'000, 10, "avg(v)");
-    addCase("slidingWindowAvg_k100", 100'000, 100, "avg(v)");
-    addCase("slidingWindowAvg_k1000", 100'000, 1'000, "avg(v)");
-    addCase("slidingWindowAvg_k10000", 100'000, 10'000, "avg(v)");
-    addCase("unboundedAvg", 100'000, -1, "avg(v)");
+    // Group B: naive vs two-stack, N=100 K, avg(v).
+    for (int32_t k : {10, 100, 1'000, 10'000}) {
+      const std::string ks = std::to_string(k);
+      addCase("naive_avg_k" + ks, 100'000, k, "avg(v)", /*disableSliding=*/true);
+      addRelCase("twoStack_avg_k" + ks, 100'000, k, "avg(v)", /*disableSliding=*/false);
+    }
 
-    // Group C: vary N, K=100, sum(v).
-    addCase("slidingWindowSum_N10K_k100", 10'000, 100, "sum(v)");
-    addCase("slidingWindowSum_N100K_k100", 100'000, 100, "sum(v)");
-    addCase("slidingWindowSum_N500K_k100", 500'000, 100, "sum(v)");
+    // Group C: two-stack scaling in N at K=100.
+    addCase("twoStack_sum_N10K_k100", 10'000, 100, "sum(v)", false);
+    addCase("twoStack_sum_N100K_k100", 100'000, 100, "sum(v)", false);
+    addCase("twoStack_sum_N500K_k100", 500'000, 100, "sum(v)", false);
   }
 
  private:
@@ -92,10 +85,10 @@ class SlidingWindowBenchmark : public VectorTestBase {
     std::string name;
     std::vector<RowVectorPtr> data;
     core::PlanNodePtr plan;
+    bool disableSlidingAgg;
     int64_t numRows;
   };
 
-  // Builds a single-partition dataset of numRows rows: one value column v.
   std::vector<RowVectorPtr> makeData(int64_t numRows) {
     const auto rowType = ROW({"s", "v"}, {INTEGER(), BIGINT()});
     std::vector<RowVectorPtr> result;
@@ -119,7 +112,7 @@ class SlidingWindowBenchmark : public VectorTestBase {
     return result;
   }
 
-  // Builds the window expression. k == -1 means UNBOUNDED PRECEDING.
+  // k == -1 means UNBOUNDED PRECEDING.
   static std::string windowExpr(const std::string& agg, int32_t k) {
     const std::string frame = (k < 0)
         ? "rows between unbounded preceding and current row"
@@ -127,47 +120,68 @@ class SlidingWindowBenchmark : public VectorTestBase {
     return agg + " over (order by s " + frame + ")";
   }
 
-  void addCase(
+  void registerCase(
       const std::string& name,
       int64_t numRows,
       int32_t k,
-      const std::string& agg) {
+      const std::string& agg,
+      bool disableSlidingAgg,
+      bool relative) {
     auto tc = std::make_unique<TestCase>();
     tc->name = name;
     tc->numRows = numRows;
+    tc->disableSlidingAgg = disableSlidingAgg;
     tc->data = makeData(numRows);
-    // Use streamingWindow: data is already sorted by s (single partition).
     tc->plan = exec::test::PlanBuilder()
                    .values(tc->data)
                    .streamingWindow({windowExpr(agg, k)})
                    .planNode();
 
     const auto* raw = tc.get();
-    folly::addBenchmark(
-        __FILE__,
-        name,
-        [this, raw](folly::UserCounters& counters, unsigned iterations) {
-          CpuWallTiming timing;
-          uint64_t totalRows = 0;
-          for (unsigned i = 0; i < iterations; ++i) {
-            totalRows += runOnce(*raw, timing);
-          }
-          BENCHMARK_SUSPEND {
-            counters["rows"] = folly::UserMetric(
-                static_cast<int64_t>(raw->numRows),
-                folly::UserMetric::Type::METRIC);
-            counters["windowCpuSec"] = folly::UserMetric(
-                static_cast<double>(timing.cpuNanos) / iterations / 1e9,
-                folly::UserMetric::Type::TIME);
-            counters["windowWallSec"] = folly::UserMetric(
-                static_cast<double>(timing.wallNanos) / iterations / 1e9,
-                folly::UserMetric::Type::TIME);
-            folly::doNotOptimizeAway(totalRows);
-          }
-          return iterations;
-        });
+    auto fn = [this, raw](
+                  folly::UserCounters& counters, unsigned iterations) {
+      CpuWallTiming timing;
+      uint64_t totalRows = 0;
+      for (unsigned i = 0; i < iterations; ++i) {
+        totalRows += runOnce(*raw, timing);
+      }
+      BENCHMARK_SUSPEND {
+        counters["rows"] = folly::UserMetric(
+            static_cast<int64_t>(raw->numRows),
+            folly::UserMetric::Type::METRIC);
+        counters["wallSec"] = folly::UserMetric(
+            static_cast<double>(timing.wallNanos) / iterations / 1e9,
+            folly::UserMetric::Type::TIME);
+        folly::doNotOptimizeAway(totalRows);
+      }
+      return iterations;
+    };
+
+    if (relative) {
+      folly::addBenchmark(__FILE__, "%" + name, fn);
+    } else {
+      folly::addBenchmark(__FILE__, name, fn);
+    }
 
     cases_.push_back(std::move(tc));
+  }
+
+  void addCase(
+      const std::string& name,
+      int64_t numRows,
+      int32_t k,
+      const std::string& agg,
+      bool disableSlidingAgg) {
+    registerCase(name, numRows, k, agg, disableSlidingAgg, /*relative=*/false);
+  }
+
+  void addRelCase(
+      const std::string& name,
+      int64_t numRows,
+      int32_t k,
+      const std::string& agg,
+      bool disableSlidingAgg) {
+    registerCase(name, numRows, k, agg, disableSlidingAgg, /*relative=*/true);
   }
 
   uint64_t runOnce(const TestCase& tc, CpuWallTiming& timing) const {
@@ -178,7 +192,10 @@ class SlidingWindowBenchmark : public VectorTestBase {
       params.serialExecution = true;
       params.queryConfigs = {
           {core::QueryConfig::kPreferredOutputBatchRows,
-           std::to_string(kOutputBatchRows)}};
+           std::to_string(kOutputBatchRows)},
+          {core::QueryConfig::kWindowSlidingAggDisabled,
+           tc.disableSlidingAgg ? "true" : "false"},
+      };
       cursor = TaskCursor::create(params);
     }
 

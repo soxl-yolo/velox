@@ -604,6 +604,17 @@ class QueryConfig {
       true,
       "Enable order-by spilling. Requires spill_enabled.")
 
+  /// Disables the two-stack sliding window aggregation algorithm, forcing the
+  /// naive per-row recomputation path instead. For benchmarking and debugging
+  /// only; do not set in production.
+  VELOX_QUERY_CONFIG(
+      kWindowSlidingAggDisabled,
+      windowSlidingAggDisabled,
+      "window_sliding_agg_disabled",
+      bool,
+      false,
+      "Disable two-stack sliding window aggregation; use naive recomputation.")
+
   /// Window spilling flag, only applies if "spill_enabled" flag is set.
   VELOX_QUERY_CONFIG(
       kWindowSpillEnabled,
