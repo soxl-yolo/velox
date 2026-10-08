@@ -198,6 +198,14 @@ target_link_libraries(
   Folly::follybenchmark
 )
 
+add_executable(velox_valid_frames_benchmark ValidFramesBenchmark.cpp)
+
+target_link_libraries(
+  velox_valid_frames_benchmark
+  velox_vector
+  Folly::follybenchmark
+)
+
 add_executable(velox_mark_sorted_benchmark MarkSortedBenchmark.cpp)
 
 target_link_libraries(
