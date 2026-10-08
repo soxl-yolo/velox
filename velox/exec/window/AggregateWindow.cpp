@@ -343,6 +343,14 @@ class AggregateWindowFunction : public exec::WindowFunction {
 
     slidingAggDisabled_ = config.windowSlidingAggDisabled();
 
+    // Use a higher frame-width threshold for aggregates whose intermediate
+    // type differs from the result type (e.g. avg: ROW(sum,count) vs DOUBLE).
+    // Those aggregates pay a serialization cost on every push into the back
+    // stack, so the two-stack breakeven is ~K=1000 instead of ~K=400.
+    if (!intermediateType_->equivalent(*resultType)) {
+      slidingWindowMinFrameWidth_ = 1000;
+    }
+
     computeDefaultAggregateValue(resultType);
   }
 
@@ -358,6 +366,7 @@ class AggregateWindowFunction : public exec::WindowFunction {
   void resetPartition(const exec::WindowPartition* partition) override {
     partition_ = partition;
     previousFrameMetadata_.reset();
+    partitionUseTwoStack_.reset();
     if (slidingWindowAgg_) {
       slidingWindowAgg_->reset();
     }
@@ -411,13 +420,38 @@ class AggregateWindowFunction : public exec::WindowFunction {
           resultOffset,
           result);
     } else if (frameMetadata.slidingWindow && !slidingAggDisabled_) {
-      slidingWindowAggregation(
-          validRows,
-          frameMetadata,
-          rawFrameStarts,
-          rawFrameEnds,
-          resultOffset,
-          result);
+      // Decide once per partition whether the frame is wide enough to amortise
+      // the two-stack overhead. Measure the average frame width on the first
+      // sliding-window batch and cache the result for the rest of the partition.
+      if (!partitionUseTwoStack_.has_value()) {
+        int64_t totalWidth = 0;
+        int32_t cnt = 0;
+        validRows.applyToSelected([&](auto i) {
+          totalWidth += rawFrameEnds[i] - rawFrameStarts[i] + 1;
+          ++cnt;
+        });
+        const double avgWidth = cnt > 0 ? static_cast<double>(totalWidth) / cnt : 0;
+        partitionUseTwoStack_ = (avgWidth >= slidingWindowMinFrameWidth_);
+      }
+      if (*partitionUseTwoStack_) {
+        slidingWindowAggregation(
+            validRows,
+            frameMetadata,
+            rawFrameStarts,
+            rawFrameEnds,
+            resultOffset,
+            result);
+      } else {
+        fillArgVectors(frameMetadata.firstRow, frameMetadata.lastRow);
+        simpleAggregation(
+            validRows,
+            frameMetadata.firstRow,
+            frameMetadata.lastRow,
+            rawFrameStarts,
+            rawFrameEnds,
+            resultOffset,
+            result);
+      }
     } else {
       fillArgVectors(frameMetadata.firstRow, frameMetadata.lastRow);
       simpleAggregation(
@@ -775,6 +809,20 @@ class AggregateWindowFunction : public exec::WindowFunction {
   /// window_sliding_agg_disabled query config; useful for benchmarking and
   /// debugging.
   bool slidingAggDisabled_{false};
+
+  /// Minimum average frame width (in rows) required before activating the
+  /// two-stack path for this partition. Set once in the constructor based on
+  /// whether the intermediate accumulator type matches the result type:
+  ///   - same type (sum, count, min, max): merge is a single arithmetic op,
+  ///     breakeven is ~K=400 → threshold = 400.
+  ///   - different type (avg → ROW(sum,count)): merge involves ROW
+  ///     serialization, breakeven is ~K=1000 → threshold = 1000.
+  int32_t slidingWindowMinFrameWidth_{400};
+
+  /// Set on the first apply() call of each partition when the frame is
+  /// detected as sliding. Caches whether the two-stack should be used for
+  /// the rest of this partition (avoids re-measuring on every batch).
+  std::optional<bool> partitionUseTwoStack_;
 };
 
 } // namespace
