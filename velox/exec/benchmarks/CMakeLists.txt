@@ -198,6 +198,18 @@ target_link_libraries(
   Folly::follybenchmark
 )
 
+add_executable(velox_sliding_window_benchmark SlidingWindowBenchmark.cpp)
+
+target_link_libraries(
+  velox_sliding_window_benchmark
+  velox_aggregates
+  velox_exec
+  velox_exec_test_lib
+  velox_vector_test_lib
+  velox_window
+  Folly::follybenchmark
+)
+
 add_executable(velox_valid_frames_benchmark ValidFramesBenchmark.cpp)
 
 target_link_libraries(
