@@ -881,6 +881,7 @@ void partitionBloomFilterRowsImpl(
 
 void partitionBloomFilterRows(
     const VectorHasher& hasher,
+    column_index_t columnIndex,
     int32_t offset,
     const common::BigintValuesUsingBloomFilter& filter,
     const RowContainer& rowContainer,
@@ -897,6 +898,26 @@ void partitionBloomFilterRows(
       partitionBloomFilterRowsImpl<int64_t>(
           offset, filter, rowContainer, numPartitions - 1, rowPartitions);
       break;
+    case TypeKind::VARCHAR:
+    case TypeKind::VARBINARY: {
+      char* rows[kHashBatchSize];
+      uint64_t hashes[kHashBatchSize];
+      uint8_t partitions[kHashBatchSize];
+      RowContainerIterator iter;
+      while (auto numRows = rowContainer.listRows(
+                 &iter, kHashBatchSize, RowContainer::kUnlimited, rows)) {
+        rowContainer.hash(
+            columnIndex, folly::Range<char**>(rows, numRows), false, hashes);
+        for (int i = 0; i < numRows; ++i) {
+          partitions[i] =
+              filter.blockIndex(static_cast<int64_t>(hashes[i])) &
+              (numPartitions - 1);
+        }
+        rowPartitions.appendPartitions(
+            folly::Range<const uint8_t*>(partitions, numRows));
+      }
+      break;
+    }
     default:
       VELOX_UNREACHABLE();
   }
@@ -915,6 +936,8 @@ void buildBloomFilterImpl(
 
 void buildBloomFilter(
     const VectorHasher& hasher,
+    const RowContainer& rowContainer,
+    column_index_t columnIndex,
     int32_t offset,
     char** rows,
     int numRows,
@@ -927,6 +950,16 @@ void buildBloomFilter(
     case TypeKind::BIGINT:
       buildBloomFilterImpl<int64_t>(offset, rows, numRows, filter);
       break;
+    case TypeKind::VARCHAR:
+    case TypeKind::VARBINARY: {
+      uint64_t hashes[kHashBatchSize];
+      rowContainer.hash(
+          columnIndex, folly::Range<char**>(rows, numRows), false, hashes);
+      for (int i = 0; i < numRows; ++i) {
+        filter.insert(static_cast<int64_t>(hashes[i]));
+      }
+      break;
+    }
     default:
       VELOX_UNREACHABLE();
   }
@@ -1149,6 +1182,7 @@ void HashTable<ignoreNullKeys>::parallelJoinBuild() {
         runStep(
             bloomFilterPartitionSteps,
             [hasher = hashers_[i].get(),
+             i,
              offset = rows->columnAt(i).offset(),
              filter,
              rows,
@@ -1156,6 +1190,7 @@ void HashTable<ignoreNullKeys>::parallelJoinBuild() {
              rowPartitions = rowPartitions[j].get()] {
               partitionBloomFilterRows(
                   *hasher,
+                  i,
                   offset,
                   *filter,
                   *rows,
@@ -1293,7 +1328,13 @@ void HashTable<true>::buildBloomFilterPartition(
     while (auto numRows = table->rows_->listPartitionRows(
                iter, partition, kHashBatchSize, *rowPartitions[i], rows)) {
       buildBloomFilter(
-          *hashers_[columnIndex], rowColumn.offset(), rows, numRows, *filter);
+          *hashers_[columnIndex],
+          *table->rows_,
+          columnIndex,
+          rowColumn.offset(),
+          rows,
+          numRows,
+          *filter);
     }
   }
 }
@@ -1585,6 +1626,8 @@ void HashTable<ignoreNullKeys>::rehash(
           }
           buildBloomFilter(
               *hashers_[j],
+              *table->rows(),
+              j,
               table->rows()->columnAt(j).offset(),
               groups,
               numGroups,

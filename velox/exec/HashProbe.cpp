@@ -49,6 +49,27 @@ int64_t applyBloomFilter(
   });
   return numAccepted;
 }
+
+int64_t applyStringBloomFilter(
+    const common::BigintValuesUsingBloomFilter& filter,
+    VectorHasher& hasher,
+    SelectivityVector& rows,
+    raw_vector<uint64_t>& hashes) {
+  if (rows.countSelected() == 0) {
+    return 0;
+  }
+  hashes.resize(rows.size());
+  hasher.hash(rows, false, hashes);
+  int64_t numAccepted = 0;
+  rows.applyToSelected([&](vector_size_t row) {
+    if (filter.testInt64(static_cast<int64_t>(hashes[row]))) {
+      ++numAccepted;
+    } else {
+      rows.setValid(row, false);
+    }
+  });
+  return numAccepted;
+}
 } // namespace
 
 // static
@@ -482,6 +503,7 @@ void HashProbe::applyBloomFilterForJoinProbe() {
   const int64_t numTested = activeRows_.countSelected();
   int64_t numAccepted = numTested;
   const bool isSampling = bloomFilterSampledRows_ < bypassBloomFilterMinRows_;
+  raw_vector<uint64_t> stringHashes(pool());
   for (auto i = 0; i < hashers_.size(); ++i) {
     const auto& filter = table_->hashers()[i]->getBloomFilter();
     if (!filter) {
@@ -499,6 +521,11 @@ void HashProbe::applyBloomFilterForJoinProbe() {
       case TypeKind::BIGINT:
         numAccepted =
             applyBloomFilter<int64_t>(*bloomFilter, decoded, activeRows_);
+        break;
+      case TypeKind::VARCHAR:
+      case TypeKind::VARBINARY:
+        numAccepted = applyStringBloomFilter(
+            *bloomFilter, *hashers_[i], activeRows_, stringHashes);
         break;
       default:
         VELOX_UNREACHABLE();

@@ -552,11 +552,12 @@ class AggregateWindowFunction : public exec::WindowFunction {
     // For variable-size aggregates (e.g. array_agg, map_agg, histogram) the
     // prefix accumulator at back stack position i holds O(i) data, so W
     // prefixes together consume O(W²) space — worse than the O(W) state kept
-    // by simpleAggregation. accumulatorUsesExternalMemory() is insufficient
-    // because it only covers memory outside Velox's allocator; isFixedSize()
-    // is the correct predicate for "accumulator size does not grow with input".
+    // by simpleAggregation. Check both size and external memory: some
+    // aggregates (e.g. arbitrary on strings) retain variable-size values in
+    // external memory without overriding isFixedSize().
     bool slidingWindow = startNonDecreasing && endNonDecreasing &&
-        !incrementalAggregation && aggregate_->isFixedSize();
+        !incrementalAggregation && aggregate_->isFixedSize() &&
+        !aggregate_->accumulatorUsesExternalMemory();
 
     bool usePreviousAggregate = false;
     if (previousFrameMetadata_.has_value()) {

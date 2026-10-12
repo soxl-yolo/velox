@@ -272,9 +272,11 @@ class VectorHasher {
       return false;
     }
     switch (typeKind_) {
-      // Smaller integers would never overflow 100'000 distinct values.
+      // Use Bloom filters only after exact distinct-value tracking overflows.
       case TypeKind::INTEGER:
       case TypeKind::BIGINT:
+      case TypeKind::VARCHAR:
+      case TypeKind::VARBINARY:
         return distinctOverflow_;
       case TypeKind::HUGEINT:
         // TODO: Add 128-bit bloom filter support. HUGEINT dynamic filters are

@@ -2069,6 +2069,65 @@ TEST_P(HashJoinTest, bloomFilterLocalProbeInt32Keys) {
       .run();
 }
 
+TEST_P(HashJoinTest, bloomFilterLocalProbeStringKeys) {
+  constexpr auto numRows = 1 + VectorHasher::kMaxDistinct;
+  for (const auto& keyType : std::vector<TypePtr>{VARCHAR(), VARBINARY()}) {
+    SCOPED_TRACE(keyType->toString());
+    auto probe = makeRowVector(
+        {"t_k0"},
+        {makeFlatVector<std::string>(
+            numRows,
+            [](auto row) {
+              return fmt::format(
+                  "dimension_key_{:010}", 1'000 * row + (row % 2));
+            },
+            nullptr,
+            keyType)});
+    auto build = makeRowVector(
+        {"u_k0"},
+        {makeFlatVector<std::string>(
+            numRows,
+            [](auto row) {
+              return fmt::format("dimension_key_{:010}", 1'000 * row);
+            },
+            nullptr,
+            keyType)});
+
+    HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+        .numDrivers(1)
+        .injectSpill(false)
+        .probeType(asRowType(probe->type()))
+        .probeKeys({"t_k0"})
+        .probeVectors({probe})
+        .buildType(asRowType(build->type()))
+        .buildKeys({"u_k0"})
+        .buildVectors({build})
+        .joinType(core::JoinType::kLeft)
+        .joinOutputLayout({"t_k0", "u_k0"})
+        .referenceQuery(
+            "SELECT t.t_k0, u.u_k0 FROM t LEFT JOIN u ON t.t_k0 = u.u_k0")
+        .config(
+            core::QueryConfig::kHashProbeBloomFilterPushdownMaxSize, "1048576")
+        .config(core::QueryConfig::kBypassHashProbeBloomFilterMinRows, "100")
+        .config(core::QueryConfig::kBypassHashProbeBloomFilterMinPct, "85")
+        .verifier([numRows](const std::shared_ptr<Task>& task, bool hasSpill) {
+          ASSERT_FALSE(hasSpill);
+          const auto testedRows =
+              getOperatorRuntimeStats(
+                  task, 1, std::string(HashProbe::kBloomFilterTestedRows))
+                  .sum;
+          const auto acceptedRows =
+              getOperatorRuntimeStats(
+                  task, 1, std::string(HashProbe::kBloomFilterAcceptedRows))
+                  .sum;
+          EXPECT_EQ(testedRows, numRows);
+          EXPECT_GE(acceptedRows, numRows / 2);
+          EXPECT_LT(acceptedRows, numRows * 60 / 100);
+        })
+        .run();
+  }
+}
+
 TEST_P(HashJoinTest, bypassBloomFilterLocalProbe) {
   struct TestCase {
     const char* name;

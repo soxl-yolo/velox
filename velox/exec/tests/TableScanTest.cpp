@@ -6016,6 +6016,66 @@ TEST_F(TableScanTest, bloomFilterPushdown) {
   }
 }
 
+TEST_F(TableScanTest, stringBloomFilterPushdown) {
+  const auto numBuildRows = 1 + VectorHasher::kMaxDistinct;
+  auto build = makeRowVector(
+      {"b"},
+      {makeFlatVector<std::string>(numBuildRows, [](auto row) {
+        return fmt::format("dimension_key_{:010}", 1'000 * row);
+      })});
+  auto probe = makeRowVector(
+      {"a"},
+      {makeFlatVector<std::string>(2 * numBuildRows, [](auto row) {
+        return fmt::format("dimension_key_{:010}", 500 * row);
+      })});
+
+  auto probeFile = TempFilePath::create();
+  auto buildFile = TempFilePath::create();
+  writeToFile(probeFile->getPath(), {probe});
+  writeToFile(buildFile->getPath(), {build});
+
+  auto idGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  core::PlanNodeId probeScanId, buildScanId, joinId;
+  auto plan = PlanBuilder(idGenerator)
+                  .tableScan(ROW({"a"}, {VARCHAR()}))
+                  .capturePlanNodeId(probeScanId)
+                  .hashJoin(
+                      {"a"},
+                      {"b"},
+                      PlanBuilder(idGenerator)
+                          .tableScan(ROW({"b"}, {VARCHAR()}))
+                          .capturePlanNodeId(buildScanId)
+                          .planNode(),
+                      "",
+                      {"a"})
+                  .capturePlanNodeId(joinId)
+                  .planNode();
+
+  for (bool parallelBuild : {false, true}) {
+    SCOPED_TRACE(fmt::format("parallelBuild={}", parallelBuild));
+    AssertQueryBuilder builder(plan);
+    builder
+        .config(
+            core::QueryConfig::kHashProbeBloomFilterPushdownMaxSize,
+            std::to_string(4 * numBuildRows))
+        .config(
+            core::QueryConfig::kHashProbeStringDynamicFilterPushdownEnabled,
+            "true")
+        .split(probeScanId, makeHiveConnectorSplit(probeFile->getPath()))
+        .split(buildScanId, makeHiveConnectorSplit(buildFile->getPath()));
+    if (parallelBuild) {
+      builder.serialExecution(false).maxDrivers(2).config(
+          core::QueryConfig::kMinTableRowsForParallelJoinBuild, "1");
+    }
+    auto task = builder.assertResults(build);
+    auto planStats = toPlanStats(task->taskStats());
+    ASSERT_EQ(
+        planStats.at(joinId).customStats.at("dynamicFiltersProduced").sum,
+        parallelBuild ? 2 : 1);
+    ASSERT_GT(planStats.at(joinId).customStats.at("bloomFilterSize").sum, 0);
+  }
+}
+
 // TODO: re-enable this test once we add back driver suspension support for
 // table scan.
 TEST_F(TableScanTest, DISABLED_memoryArbitrationWithSlowTableScan) {

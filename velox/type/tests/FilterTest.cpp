@@ -761,6 +761,28 @@ TEST(FilterTest, bigintValuesUsingBloomFilter) {
   ASSERT_TRUE(nullAllowedClone->clone(false)->testingEquals(filter));
 }
 
+TEST(FilterTest, bigintValuesUsingBloomFilterStringHashes) {
+  BigintValuesUsingBloomFilter filter(100, false);
+  const std::vector<std::string> values = {
+      "city", "category", "a much longer string value", std::string("a\0b", 3)};
+  for (const auto& value : values) {
+    filter.insert(static_cast<int64_t>(
+        folly::hasher<StringView>()(StringView(value))));
+  }
+  for (const auto& value : values) {
+    EXPECT_TRUE(filter.testBytes(value.data(), value.size()));
+  }
+  EXPECT_TRUE(filter.testBytesRange(
+      std::string_view("a"), std::string_view("z"), false));
+
+  Filter::registerSerDe();
+  auto restored = ISerializable::deserialize<BigintValuesUsingBloomFilter>(
+      filter.serialize());
+  for (const auto& value : values) {
+    EXPECT_TRUE(restored->testBytes(value.data(), value.size()));
+  }
+}
+
 TEST(FilterTest, bigintValuesUsingBloomFilterMergeWith) {
   BigintValuesUsingBloomFilter filter(4, false);
   for (int64_t x : {2, 3, 5, 7}) {

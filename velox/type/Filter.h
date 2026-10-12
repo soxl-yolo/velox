@@ -1310,6 +1310,21 @@ class BigintValuesUsingBloomFilter final : public Filter {
     return filter_.mayContain(hash(value));
   }
 
+  bool testBytes(const char* value, int32_t length) const final {
+    // String-key Bloom filters store the same StringView hash that
+    // VectorHasher and RowContainer use for join keys.
+    return testInt64(static_cast<int64_t>(
+        folly::hasher<StringView>()(StringView(value, length))));
+  }
+
+  bool testBytesRange(
+      std::optional<std::string_view> /*min*/,
+      std::optional<std::string_view> /*max*/,
+      bool /*hasNull*/) const final {
+    // A Bloom filter cannot rule out an arbitrary interval of strings.
+    return true;
+  }
+
   xsimd::batch_bool<int64_t> testValues(xsimd::batch<int64_t> x) const final {
     return genericTestValues(x, [this](int64_t x) { return testInt64(x); });
   }
